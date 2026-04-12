@@ -16,8 +16,6 @@ async def main() -> None:
     logger.info("Starting Magnolia Verde bot")
 
     db = DatabaseManager(settings)
-    await db.create_schema()
-
     services = build_service_container(db)
     bot = create_bot(settings)
     dispatcher = create_dispatcher(settings, services)

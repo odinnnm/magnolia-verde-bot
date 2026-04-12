@@ -89,7 +89,7 @@ def setup_router(services: ServiceContainer, settings: Settings) -> Router:
         lines = ["Последние черновики:"]
         for draft in drafts:
             lines.append(
-                f"• #{draft.id} [{draft.status}] {draft.object_type or 'композиция'}"
+                f"• #{draft.id} [{draft.status.value}] {draft.object_type or 'композиция'}"
             )
         await message.answer("\n".join(lines))
 
