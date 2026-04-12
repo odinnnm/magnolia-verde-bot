@@ -146,6 +146,22 @@ class PostRepository:
             )
             return result.scalar_one_or_none()
 
+    def build_draft_view(self, post: Post) -> DraftPost:
+        photo_file_id = post.source_photo_file_id
+        if post.images:
+            photo_file_id = post.images[0].telegram_file_id
+
+        return DraftPost(
+            photo_file_id=photo_file_id or "",
+            object_type=post.object_type or "композиция",
+            colors=post.colors or [],
+            style_tags=post.style_tags or [],
+            caption=post.caption,
+            price_text=post.price_text,
+            availability_text=post.availability_text,
+            story_text=post.story_text,
+        )
+
     async def update_post(
         self,
         post_id: UUID,
@@ -216,6 +232,17 @@ class PostRepository:
             if status is not PostStatus.published:
                 post.published_at = None
                 post.published_message_id = None
+            await session.commit()
+            await session.refresh(post)
+            return post
+
+    async def mark_failed(self, post_id: UUID, reason: str) -> Post | None:
+        async with self.session_factory() as session:
+            post = await session.get(Post, post_id)
+            if post is None:
+                return None
+            post.status = PostStatus.failed
+            post.failed_reason = reason[:1000]
             await session.commit()
             await session.refresh(post)
             return post

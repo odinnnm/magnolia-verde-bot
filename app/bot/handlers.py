@@ -2,14 +2,15 @@ import logging
 from uuid import UUID
 
 from aiogram import Bot, F, Router
-from aiogram.types.error_event import ErrorEvent
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
+from aiogram.types.error_event import ErrorEvent
 
-from app.db.models import PostStatus
 from app.bot.access import reject_callback_if_not_allowed, reject_message_if_not_allowed
 from app.bot.keyboards import make_preview_keyboard
+from app.db.models import PostStatus
 from app.fsm.states import DraftCreation
 from app.schemas.draft import DraftPost
 from app.services.container import ServiceContainer
@@ -28,32 +29,25 @@ def setup_router(services: ServiceContainer, settings: Settings) -> Router:
             return None
         return UUID(raw_post_id)
 
-    async def get_draft(state: FSMContext) -> DraftPost | None:
-        data = await state.get_data()
-        raw_draft = data.get("draft")
-        if not raw_draft:
-            return None
-        return DraftPost.model_validate(raw_draft)
-
     async def save_context_to_state(state: FSMContext, post_id: UUID, draft: DraftPost) -> None:
         await state.update_data(
             post_id=str(post_id),
             draft=draft.model_dump(mode="json"),
         )
 
-    async def persist_post(
-        state: FSMContext,
-        draft: DraftPost,
-        status: PostStatus | None = None,
-    ) -> UUID | None:
+    async def get_current_post(state: FSMContext) -> tuple[UUID | None, DraftPost | None]:
         post_id = await get_post_id(state)
         if not post_id:
-            return None
-        post = await services.post_repository.update_post(post_id=post_id, draft=draft, status=status)
+            return None, None
+
+        post = await services.post_repository.get_by_id(post_id)
         if not post:
-            return None
+            logger.warning("Post not found in repository for post_id=%s", post_id)
+            return post_id, None
+
+        draft = services.post_repository.build_draft_view(post)
         await save_context_to_state(state, post.id, draft)
-        return post.id
+        return post.id, draft
 
     async def archive_current_post(state: FSMContext) -> None:
         post_id = await get_post_id(state)
@@ -61,11 +55,40 @@ def setup_router(services: ServiceContainer, settings: Settings) -> Router:
             return
         await services.post_repository.set_status(post_id, PostStatus.archived)
 
-    async def update_preview(callback: CallbackQuery, draft: DraftPost) -> None:
-        await callback.message.edit_caption(
-            caption=draft.build_preview_text(),
-            reply_markup=make_preview_keyboard().as_markup(),
-        )
+    async def update_preview(callback: CallbackQuery, draft: DraftPost) -> bool:
+        try:
+            await callback.message.edit_caption(
+                caption=draft.build_preview_text(),
+                reply_markup=make_preview_keyboard().as_markup(),
+            )
+            return True
+        except TelegramBadRequest as exc:
+            if "message is not modified" in str(exc).lower():
+                logger.info("Preview message was not modified for user_id=%s", callback.from_user.id)
+                return False
+            raise
+
+    async def load_post_for_callback(
+        callback: CallbackQuery,
+        state: FSMContext,
+    ) -> tuple[UUID | None, DraftPost | None, str | None, bool]:
+        callback_text: str | None = None
+        show_alert = False
+
+        if await reject_callback_if_not_allowed(callback, settings):
+            return None, None, callback_text, show_alert
+
+        post_id, draft = await get_current_post(state)
+        if not post_id:
+            callback_text = "Текущий сценарий уже завершён или сброшен. Начните новый через /new."
+            show_alert = True
+            return None, None, callback_text, show_alert
+        if not draft:
+            callback_text = "Черновик не найден в базе. Начните новый сценарий через /new."
+            show_alert = True
+            return None, None, callback_text, show_alert
+
+        return post_id, draft, callback_text, show_alert
 
     @router.error()
     async def on_error(event: ErrorEvent) -> None:
@@ -83,12 +106,17 @@ def setup_router(services: ServiceContainer, settings: Settings) -> Router:
             return
         await state.clear()
         await message.answer(
-            "Привет! Я MVP-бот Магнолия Верде.\n\n"
-            "Команды:\n"
+            "Привет! Я бот Magnolia Verde для подготовки постов в Telegram-канал.\n\n"
+            "Что я умею:\n"
+            "• принять фото букета или цветка;\n"
+            "• собрать черновик подписи;\n"
+            "• показать предпросмотр;\n"
+            "• сохранить черновик или опубликовать пост.\n\n"
+            "Основные команды:\n"
             "/new — создать новый пост\n"
-            "/drafts — показать сохранённые черновики\n"
-            "/help — список команд\n"
-            "/cancel — сбросить текущий сценарий"
+            "/drafts — посмотреть последние черновики\n"
+            "/help — подсказка по командам\n"
+            "/cancel — отменить текущий сценарий"
         )
 
     @router.message(Command("help"))
@@ -96,11 +124,18 @@ def setup_router(services: ServiceContainer, settings: Settings) -> Router:
         if await reject_message_if_not_allowed(message, settings):
             return
         await message.answer(
-            "Доступные команды:\n"
-            "/start — приветствие\n"
-            "/new — новый пост\n"
-            "/drafts — последние черновики из БД\n"
-            "/cancel — отмена текущего сценария"
+            "Подсказка по работе с ботом:\n\n"
+            "/start — краткое описание и быстрый старт\n"
+            "/new — начать новый сценарий и отправить фото\n"
+            "/drafts — показать последние сохранённые черновики\n"
+            "/cancel — отменить текущий сценарий\n\n"
+            "После фото бот покажет предпросмотр, где можно:\n"
+            "• перегенерировать подпись;\n"
+            "• сократить текст;\n"
+            "• сделать подпись более премиальной;\n"
+            "• добавить цену, наличие и историю;\n"
+            "• отредактировать текст вручную;\n"
+            "• сохранить черновик или опубликовать пост."
         )
 
     @router.message(Command("new"))
@@ -110,7 +145,7 @@ def setup_router(services: ServiceContainer, settings: Settings) -> Router:
         logger.info("Starting new post flow for user_id=%s", message.from_user.id)
         await state.clear()
         await state.set_state(DraftCreation.waiting_for_photo)
-        await message.answer("Отправьте фото цветка или букета.")
+        await message.answer("Отправьте одно фото цветка или букета, и я соберу черновик поста.")
 
     @router.message(Command("drafts"))
     async def cmd_drafts(message: Message) -> None:
@@ -118,14 +153,22 @@ def setup_router(services: ServiceContainer, settings: Settings) -> Router:
             return
         drafts = await services.draft_repository.list_user_drafts(message.from_user.id)
         if not drafts:
-            await message.answer("Сохранённых черновиков пока нет.")
+            await message.answer(
+                "Сохранённых черновиков пока нет.\n"
+                "Начните новый сценарий через /new и сохраните пост кнопкой «Сохранить в черновики»."
+            )
             return
 
         lines = ["Последние черновики:"]
         for draft in drafts:
-            lines.append(
-                f"• #{draft.id} [{draft.status.value}] {draft.object_type or 'композиция'}"
-            )
+            caption_preview = (draft.caption or "").strip().replace("\n", " ")
+            if len(caption_preview) > 80:
+                caption_preview = caption_preview[:77] + "..."
+            lines.append(f"• #{draft.id} | статус: {draft.status.value} | {draft.object_type or 'композиция'}")
+            if caption_preview:
+                lines.append(f"  {caption_preview}")
+        lines.append("")
+        lines.append("Пока команда показывает список. Восстановление черновика в предпросмотр будет следующим шагом.")
         await message.answer("\n".join(lines))
 
     @router.message(Command("cancel"))
@@ -135,7 +178,7 @@ def setup_router(services: ServiceContainer, settings: Settings) -> Router:
         await archive_current_post(state)
         await state.clear()
         logger.info("Current flow cancelled by user_id=%s", message.from_user.id)
-        await message.answer("Текущий сценарий отменён.")
+        await message.answer("Текущий сценарий отменён. Можно начать заново через /new.")
 
     @router.message(DraftCreation.waiting_for_photo, F.photo)
     @router.message(F.photo)
@@ -178,16 +221,21 @@ def setup_router(services: ServiceContainer, settings: Settings) -> Router:
     async def receive_price(message: Message, state: FSMContext) -> None:
         if await reject_message_if_not_allowed(message, settings):
             return
-        draft = await get_draft(state)
-        if not draft:
+        post_id, draft = await get_current_post(state)
+        if not post_id or not draft:
             await state.clear()
-            await message.answer("Черновик не найден. Начните заново через /new.")
+            await message.answer("Не удалось найти текущий черновик. Начните заново через /new.")
             return
         draft.price_text = services.draft_factory.normalize_price(message.text)
-        await persist_post(state, draft)
+        updated_post = await services.post_repository.update_post(post_id=post_id, draft=draft)
+        if not updated_post:
+            await state.clear()
+            await message.answer("Не удалось обновить черновик. Начните заново через /new.")
+            return
+        await save_context_to_state(state, updated_post.id, draft)
         await state.set_state(None)
         logger.info("Updated price for user_id=%s", message.from_user.id)
-        await message.answer("Цену добавил.")
+        await message.answer("Цену добавил. Ниже обновлённый предпросмотр.")
         await message.answer_photo(
             photo=draft.photo_file_id,
             caption=draft.build_preview_text(),
@@ -198,16 +246,21 @@ def setup_router(services: ServiceContainer, settings: Settings) -> Router:
     async def receive_availability(message: Message, state: FSMContext) -> None:
         if await reject_message_if_not_allowed(message, settings):
             return
-        draft = await get_draft(state)
-        if not draft:
+        post_id, draft = await get_current_post(state)
+        if not post_id or not draft:
             await state.clear()
-            await message.answer("Черновик не найден. Начните заново через /new.")
+            await message.answer("Не удалось найти текущий черновик. Начните заново через /new.")
             return
         draft.availability_text = services.draft_factory.normalize_availability(message.text)
-        await persist_post(state, draft)
+        updated_post = await services.post_repository.update_post(post_id=post_id, draft=draft)
+        if not updated_post:
+            await state.clear()
+            await message.answer("Не удалось обновить черновик. Начните заново через /new.")
+            return
+        await save_context_to_state(state, updated_post.id, draft)
         await state.set_state(None)
         logger.info("Updated availability for user_id=%s", message.from_user.id)
-        await message.answer("Наличие обновил.")
+        await message.answer("Наличие обновил. Ниже обновлённый предпросмотр.")
         await message.answer_photo(
             photo=draft.photo_file_id,
             caption=draft.build_preview_text(),
@@ -218,16 +271,25 @@ def setup_router(services: ServiceContainer, settings: Settings) -> Router:
     async def receive_manual_caption(message: Message, state: FSMContext) -> None:
         if await reject_message_if_not_allowed(message, settings):
             return
-        draft = await get_draft(state)
-        if not draft:
+        post_id, draft = await get_current_post(state)
+        if not post_id or not draft:
             await state.clear()
-            await message.answer("Черновик не найден. Начните заново через /new.")
+            await message.answer("Не удалось найти текущий черновик. Начните заново через /new.")
             return
         draft.caption = message.text.strip()
-        await persist_post(state, draft)
+        updated_post = await services.post_repository.update_post(
+            post_id=post_id,
+            draft=draft,
+            status=PostStatus.ready,
+        )
+        if not updated_post:
+            await state.clear()
+            await message.answer("Не удалось обновить черновик. Начните заново через /new.")
+            return
+        await save_context_to_state(state, updated_post.id, draft)
         await state.set_state(None)
         logger.info("Updated caption manually for user_id=%s", message.from_user.id)
-        await message.answer("Текст обновил.")
+        await message.answer("Текст обновил. Ниже обновлённый предпросмотр.")
         await message.answer_photo(
             photo=draft.photo_file_id,
             caption=draft.build_preview_text(),
@@ -236,184 +298,353 @@ def setup_router(services: ServiceContainer, settings: Settings) -> Router:
 
     @router.callback_query(F.data == "shorten")
     async def cb_shorten(callback: CallbackQuery, state: FSMContext) -> None:
-        if await reject_callback_if_not_allowed(callback, settings):
-            return
-        draft = await get_draft(state)
-        if not draft:
-            await callback.answer("Черновик не найден", show_alert=True)
-            return
-        draft.caption = services.caption.shorten_caption(draft.caption)
-        await persist_post(state, draft, status=PostStatus.ready)
-        await update_preview(callback, draft)
-        logger.info("Shortened caption for user_id=%s", callback.from_user.id)
-        await callback.answer("Сократил")
+        callback_text = "Сократил"
+        show_alert = False
+
+        try:
+            post_id, draft, callback_text_override, show_alert_override = await load_post_for_callback(callback, state)
+            if callback_text_override:
+                callback_text = callback_text_override
+                show_alert = show_alert_override
+                return
+
+            assert post_id is not None and draft is not None
+            shortened_caption = services.caption.shorten_caption(draft.caption)
+            if shortened_caption == draft.caption:
+                callback_text = "Подпись уже достаточно короткая."
+                return
+
+            draft.caption = shortened_caption
+            updated_post = await services.post_repository.update_post(
+                post_id=post_id,
+                draft=draft,
+                status=PostStatus.ready,
+            )
+            if not updated_post:
+                callback_text = "Не удалось обновить черновик. Попробуйте ещё раз."
+                show_alert = True
+                return
+
+            await save_context_to_state(state, updated_post.id, draft)
+            preview_updated = await update_preview(callback, draft)
+            if not preview_updated:
+                callback_text = "Подпись уже выглядит коротко, предпросмотр не изменился."
+            logger.info("Shortened caption for user_id=%s post_id=%s", callback.from_user.id, post_id)
+        except Exception:
+            logger.exception("Caption shortening failed for user_id=%s", callback.from_user.id)
+            callback_text = "Не удалось сократить подпись. Попробуйте ещё раз."
+            show_alert = True
+        finally:
+            await callback.answer(callback_text, show_alert=show_alert)
 
     @router.callback_query(F.data == "regenerate")
     async def cb_regenerate(callback: CallbackQuery, state: FSMContext) -> None:
-        if await reject_callback_if_not_allowed(callback, settings):
-            return
-        draft = await get_draft(state)
-        if not draft:
-            await callback.answer("Черновик не найден", show_alert=True)
-            return
-        draft.caption = services.caption.generate_caption(draft.to_analysis(), premium=False)
-        await persist_post(state, draft, status=PostStatus.ready)
-        await update_preview(callback, draft)
-        logger.info("Regenerated caption for user_id=%s", callback.from_user.id)
-        await callback.answer("Перегенерировал")
+        callback_text = "Перегенерировал"
+        show_alert = False
+
+        try:
+            post_id, draft, callback_text_override, show_alert_override = await load_post_for_callback(callback, state)
+            if callback_text_override:
+                callback_text = callback_text_override
+                show_alert = show_alert_override
+                return
+
+            assert post_id is not None and draft is not None
+            current_caption = draft.caption
+            regenerated_caption = services.caption.regenerate_caption(
+                draft.to_analysis(),
+                current_caption=current_caption,
+            )
+            if not regenerated_caption:
+                callback_text = "Сейчас не удалось перегенерировать подпись для этого поста."
+                show_alert = True
+                logger.warning("Caption regeneration unavailable for post_id=%s", post_id)
+                return
+
+            if regenerated_caption == current_caption:
+                callback_text = "Не удалось подобрать новый вариант подписи. Попробуйте ещё раз позже."
+                show_alert = True
+                logger.info("Caption regeneration returned same text for post_id=%s", post_id)
+                return
+
+            draft.caption = regenerated_caption
+            updated_post = await services.post_repository.update_post(
+                post_id=post_id,
+                draft=draft,
+                status=PostStatus.ready,
+            )
+            if not updated_post:
+                callback_text = "Не удалось обновить черновик. Попробуйте ещё раз."
+                show_alert = True
+                return
+
+            await save_context_to_state(state, updated_post.id, draft)
+            preview_updated = await update_preview(callback, draft)
+            if not preview_updated:
+                callback_text = "Подпись уже актуальна, новый вариант не потребовался."
+            logger.info("Regenerated caption for user_id=%s post_id=%s", callback.from_user.id, post_id)
+        except Exception:
+            logger.exception("Caption regeneration failed for user_id=%s", callback.from_user.id)
+            callback_text = "Не удалось перегенерировать подпись. Попробуйте ещё раз."
+            show_alert = True
+        finally:
+            await callback.answer(callback_text, show_alert=show_alert)
 
     @router.callback_query(F.data == "premium")
     async def cb_premium(callback: CallbackQuery, state: FSMContext) -> None:
-        if await reject_callback_if_not_allowed(callback, settings):
-            return
-        draft = await get_draft(state)
-        if not draft:
-            await callback.answer("Черновик не найден", show_alert=True)
-            return
-        draft.caption = services.caption.generate_caption(draft.to_analysis(), premium=True)
-        await persist_post(state, draft, status=PostStatus.ready)
-        await update_preview(callback, draft)
-        logger.info("Premium caption generated for user_id=%s", callback.from_user.id)
-        await callback.answer("Сделал премиальнее")
+        callback_text = "Сделал премиальнее"
+        show_alert = False
+
+        try:
+            post_id, draft, callback_text_override, show_alert_override = await load_post_for_callback(callback, state)
+            if callback_text_override:
+                callback_text = callback_text_override
+                show_alert = show_alert_override
+                return
+
+            assert post_id is not None and draft is not None
+            premium_caption = services.caption.generate_caption(draft.to_analysis(), premium=True)
+            if premium_caption == draft.caption:
+                callback_text = "Подпись уже выглядит достаточно выразительно."
+                return
+
+            draft.caption = premium_caption
+            updated_post = await services.post_repository.update_post(
+                post_id=post_id,
+                draft=draft,
+                status=PostStatus.ready,
+            )
+            if not updated_post:
+                callback_text = "Не удалось обновить черновик. Попробуйте ещё раз."
+                show_alert = True
+                return
+
+            await save_context_to_state(state, updated_post.id, draft)
+            preview_updated = await update_preview(callback, draft)
+            if not preview_updated:
+                callback_text = "Подпись уже актуальна, предпросмотр не изменился."
+            logger.info("Premium caption generated for user_id=%s post_id=%s", callback.from_user.id, post_id)
+        except Exception:
+            logger.exception("Premium caption generation failed for user_id=%s", callback.from_user.id)
+            callback_text = "Не удалось сделать подпись более премиальной. Попробуйте ещё раз."
+            show_alert = True
+        finally:
+            await callback.answer(callback_text, show_alert=show_alert)
 
     @router.callback_query(F.data == "add_price")
     async def cb_add_price(callback: CallbackQuery, state: FSMContext) -> None:
-        if await reject_callback_if_not_allowed(callback, settings):
-            return
-        draft = await get_draft(state)
-        if not draft:
-            await callback.answer("Черновик не найден", show_alert=True)
-            return
-        await state.set_state(DraftCreation.waiting_for_price)
-        await callback.answer()
-        await callback.message.reply("Отправьте цену, например: 4500")
+        callback_text = ""
+        show_alert = False
+        try:
+            post_id, draft, callback_text_override, show_alert_override = await load_post_for_callback(callback, state)
+            if callback_text_override:
+                callback_text = callback_text_override
+                show_alert = show_alert_override
+                return
+            assert post_id is not None and draft is not None
+            await save_context_to_state(state, post_id, draft)
+            await state.set_state(DraftCreation.waiting_for_price)
+            await callback.message.reply("Отправьте цену, например: 4500")
+        finally:
+            await callback.answer(callback_text, show_alert=show_alert)
 
     @router.callback_query(F.data == "add_availability")
     async def cb_add_availability(callback: CallbackQuery, state: FSMContext) -> None:
-        if await reject_callback_if_not_allowed(callback, settings):
-            return
-        draft = await get_draft(state)
-        if not draft:
-            await callback.answer("Черновик не найден", show_alert=True)
-            return
-        await state.set_state(DraftCreation.waiting_for_availability)
-        await callback.answer()
-        await callback.message.reply(
-            "Отправьте наличие, например: В наличии, Под заказ или Ограниченное количество."
-        )
+        callback_text = ""
+        show_alert = False
+        try:
+            post_id, draft, callback_text_override, show_alert_override = await load_post_for_callback(callback, state)
+            if callback_text_override:
+                callback_text = callback_text_override
+                show_alert = show_alert_override
+                return
+            assert post_id is not None and draft is not None
+            await save_context_to_state(state, post_id, draft)
+            await state.set_state(DraftCreation.waiting_for_availability)
+            await callback.message.reply(
+                "Отправьте наличие, например: В наличии, Под заказ или Ограниченное количество."
+            )
+        finally:
+            await callback.answer(callback_text, show_alert=show_alert)
 
     @router.callback_query(F.data == "add_story")
     async def cb_add_story(callback: CallbackQuery, state: FSMContext) -> None:
-        if await reject_callback_if_not_allowed(callback, settings):
-            return
-        draft = await get_draft(state)
-        if not draft:
-            await callback.answer("Черновик не найден", show_alert=True)
-            return
-        draft.story_text = services.caption.build_story(draft.to_analysis())
-        if not draft.story_text:
-            await callback.answer("Не удалось уверенно определить историю цветка", show_alert=True)
-            return
-        await persist_post(state, draft, status=PostStatus.ready)
-        await update_preview(callback, draft)
-        logger.info("Added story for user_id=%s", callback.from_user.id)
-        await callback.answer("Историю добавил")
+        callback_text = "Историю добавил"
+        show_alert = False
+
+        try:
+            post_id, draft, callback_text_override, show_alert_override = await load_post_for_callback(callback, state)
+            if callback_text_override:
+                callback_text = callback_text_override
+                show_alert = show_alert_override
+                return
+            assert post_id is not None and draft is not None
+
+            story_text = services.caption.build_story(draft.to_analysis())
+            if not story_text:
+                callback_text = "Не удалось уверенно определить историю цветка."
+                show_alert = True
+                return
+            if story_text == draft.story_text:
+                callback_text = "История уже добавлена."
+                return
+
+            draft.story_text = story_text
+            updated_post = await services.post_repository.update_post(
+                post_id=post_id,
+                draft=draft,
+                status=PostStatus.ready,
+            )
+            if not updated_post:
+                callback_text = "Не удалось обновить черновик. Попробуйте ещё раз."
+                show_alert = True
+                return
+
+            await save_context_to_state(state, updated_post.id, draft)
+            preview_updated = await update_preview(callback, draft)
+            if not preview_updated:
+                callback_text = "История уже актуальна, предпросмотр не изменился."
+            logger.info("Added story for user_id=%s post_id=%s", callback.from_user.id, post_id)
+        except Exception:
+            logger.exception("Story generation failed for user_id=%s", callback.from_user.id)
+            callback_text = "Не удалось добавить историю. Попробуйте ещё раз."
+            show_alert = True
+        finally:
+            await callback.answer(callback_text, show_alert=show_alert)
 
     @router.callback_query(F.data == "edit_caption")
     async def cb_edit_caption(callback: CallbackQuery, state: FSMContext) -> None:
-        if await reject_callback_if_not_allowed(callback, settings):
-            return
-        draft = await get_draft(state)
-        if not draft:
-            await callback.answer("Черновик не найден", show_alert=True)
-            return
-        await state.set_state(DraftCreation.waiting_for_manual_caption)
-        await callback.answer()
-        await callback.message.reply("Отправьте новый текст подписи целиком.")
+        callback_text = ""
+        show_alert = False
+        try:
+            post_id, draft, callback_text_override, show_alert_override = await load_post_for_callback(callback, state)
+            if callback_text_override:
+                callback_text = callback_text_override
+                show_alert = show_alert_override
+                return
+            assert post_id is not None and draft is not None
+            await save_context_to_state(state, post_id, draft)
+            await state.set_state(DraftCreation.waiting_for_manual_caption)
+            await callback.message.reply("Отправьте новый текст подписи целиком.")
+        finally:
+            await callback.answer(callback_text, show_alert=show_alert)
 
     @router.callback_query(F.data == "save_draft")
     async def cb_save_draft(callback: CallbackQuery, state: FSMContext) -> None:
-        if await reject_callback_if_not_allowed(callback, settings):
-            return
-        draft = await get_draft(state)
-        post_id = await get_post_id(state)
-        if not draft:
-            await callback.answer("Черновик не найден", show_alert=True)
-            return
-        if not post_id:
-            await callback.answer("Черновик не найден", show_alert=True)
-            return
-        await services.post_repository.update_post(post_id=post_id, draft=draft, status=PostStatus.draft)
-        await state.clear()
-        logger.info("Saved draft post_id=%s for user_id=%s", post_id, callback.from_user.id)
-        await callback.answer("Черновик сохранён")
-        await callback.message.reply(f"Черновик сохранён в PostgreSQL с id {post_id}.")
+        callback_text = "Черновик сохранён"
+        show_alert = False
+
+        try:
+            post_id, draft, callback_text_override, show_alert_override = await load_post_for_callback(callback, state)
+            if callback_text_override:
+                callback_text = callback_text_override
+                show_alert = show_alert_override
+                return
+            assert post_id is not None and draft is not None
+
+            updated_post = await services.post_repository.update_post(
+                post_id=post_id,
+                draft=draft,
+                status=PostStatus.draft,
+            )
+            if not updated_post:
+                callback_text = "Не удалось сохранить черновик. Попробуйте ещё раз."
+                show_alert = True
+                return
+
+            await state.clear()
+            logger.info("Saved draft post_id=%s for user_id=%s", post_id, callback.from_user.id)
+            await callback.message.reply(f"Черновик сохранён в PostgreSQL с id {post_id}.")
+        except Exception:
+            logger.exception("Draft save failed for user_id=%s", callback.from_user.id)
+            callback_text = "Не удалось сохранить черновик. Попробуйте ещё раз."
+            show_alert = True
+        finally:
+            await callback.answer(callback_text, show_alert=show_alert)
 
     @router.callback_query(F.data == "publish")
     async def cb_publish(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
-        if await reject_callback_if_not_allowed(callback, settings):
-            return
-        draft = await get_draft(state)
-        post_id = await get_post_id(state)
-        if not draft:
-            await callback.answer("Черновик не найден", show_alert=True)
-            return
-        if not post_id:
-            await callback.answer("Черновик не найден", show_alert=True)
-            return
+        callback_text = "Опубликовано"
+        show_alert = False
 
-        channel = await services.channel_repository.get_or_create(
-            telegram_chat_id=settings.default_channel_id,
-            title="Magnolia Verde",
-            is_default=True,
-        )
-        sent_message = await services.publisher.publish(
-            bot=bot,
-            chat_id=settings.default_channel_id,
-            draft=draft,
-        )
-        await services.post_repository.mark_published(
-            post_id=post_id,
-            published_message_id=sent_message.message_id,
-            channel_id=channel.id,
-        )
-        await state.clear()
-        logger.info(
-            "Published post_id=%s by user_id=%s message_id=%s",
-            post_id,
-            callback.from_user.id,
-            sent_message.message_id,
-        )
-        await callback.answer("Опубликовано")
-        await callback.message.reply("Готово: пост отправлен в канал.")
+        try:
+            post_id, draft, callback_text_override, show_alert_override = await load_post_for_callback(callback, state)
+            if callback_text_override:
+                callback_text = callback_text_override
+                show_alert = show_alert_override
+                return
+            assert post_id is not None and draft is not None
+
+            channel = await services.channel_repository.get_or_create(
+                telegram_chat_id=settings.default_channel_id,
+                title="Magnolia Verde",
+                is_default=True,
+            )
+            sent_message = await services.publisher.publish(
+                bot=bot,
+                chat_id=settings.default_channel_id,
+                draft=draft,
+            )
+            await services.post_repository.mark_published(
+                post_id=post_id,
+                published_message_id=sent_message.message_id,
+                channel_id=channel.id,
+            )
+            await state.clear()
+            logger.info(
+                "Published post_id=%s by user_id=%s message_id=%s",
+                post_id,
+                callback.from_user.id,
+                sent_message.message_id,
+            )
+            await callback.message.reply("Готово: пост отправлен в канал.")
+        except Exception as exc:
+            logger.exception("Publish failed for user_id=%s", callback.from_user.id)
+            post_id = await get_post_id(state)
+            if post_id:
+                await services.post_repository.mark_failed(post_id, str(exc))
+            callback_text = "Не удалось опубликовать пост в канал. Черновик сохранён со статусом ошибки."
+            show_alert = True
+        finally:
+            await callback.answer(callback_text, show_alert=show_alert)
 
     @router.callback_query(F.data == "cancel")
     async def cb_cancel(callback: CallbackQuery, state: FSMContext) -> None:
-        if await reject_callback_if_not_allowed(callback, settings):
+        callback_text = "Отменено"
+        show_alert = False
+        try:
+            if await reject_callback_if_not_allowed(callback, settings):
+                return
+            await archive_current_post(state)
+            await state.clear()
+            logger.info("Cancelled current flow by user_id=%s", callback.from_user.id)
+            await callback.message.reply("Сценарий отменён. Можно начать заново через /new.")
+        finally:
+            await callback.answer(callback_text, show_alert=show_alert)
+
+    @router.message(DraftCreation.waiting_for_photo)
+    async def waiting_for_photo_fallback(message: Message) -> None:
+        if await reject_message_if_not_allowed(message, settings):
             return
-        await archive_current_post(state)
-        await state.clear()
-        logger.info("Cancelled current flow by user_id=%s", callback.from_user.id)
-        await callback.answer("Отменено")
-        await callback.message.reply("Сценарий отменён.")
+        await message.answer("Сейчас нужен именно снимок. Отправьте фото цветка или букета, либо используйте /cancel.")
 
     @router.message()
     async def fallback_message(message: Message, state: FSMContext) -> None:
         if await reject_message_if_not_allowed(message, settings):
             return
         current_state = await state.get_state()
-        if current_state == DraftCreation.waiting_for_photo.state:
-            await message.answer("Сейчас жду фото. Отправьте изображение или используйте /cancel.")
-            return
         if current_state == DraftCreation.waiting_for_price.state:
-            await message.answer("Сейчас жду цену. Отправьте число или используйте /cancel.")
+            await message.answer("Сейчас жду цену. Отправьте сумму сообщением или используйте /cancel.")
             return
         if current_state == DraftCreation.waiting_for_availability.state:
-            await message.answer("Сейчас жду наличие. Отправьте текст или используйте /cancel.")
+            await message.answer("Сейчас жду наличие. Отправьте текст сообщением или используйте /cancel.")
             return
         if current_state == DraftCreation.waiting_for_manual_caption.state:
-            await message.answer("Сейчас жду новый текст подписи. Отправьте сообщение или используйте /cancel.")
+            await message.answer("Сейчас жду новый текст подписи. Отправьте сообщение целиком или используйте /cancel.")
             return
-        await message.answer("Не понял сообщение. Используйте /new для нового поста или /help для списка команд.")
+        await message.answer(
+            "Не удалось понять сообщение.\n"
+            "Используйте /new для нового поста, /drafts для списка черновиков или /help для подсказки."
+        )
 
     return router
