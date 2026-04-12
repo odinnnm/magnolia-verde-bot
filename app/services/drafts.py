@@ -21,3 +21,16 @@ class DraftFactoryService:
         if not normalized:
             return raw_price.strip()
         return f"Стоимость: {normalized} ₽"
+
+    def normalize_availability(self, raw_value: str) -> str:
+        value = raw_value.strip()
+        if not value:
+            return "Наличие уточняется"
+        normalized = value.lower()
+        if normalized in {"в наличии", "есть"}:
+            return "В наличии"
+        if normalized in {"под заказ", "заказ"}:
+            return "Под заказ"
+        if normalized in {"ограничено", "ограниченное количество"}:
+            return "Ограниченное количество"
+        return value[:120]

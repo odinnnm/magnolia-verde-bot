@@ -4,6 +4,7 @@ from uuid import UUID
 
 from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.orm import selectinload
 
 from app.db.models import Channel, Post, PostImage, PostStatus, User
 from app.schemas.draft import DraftPost
@@ -136,6 +137,61 @@ class PostRepository:
             await session.refresh(post)
             return post
 
+    async def get_by_id(self, post_id: UUID) -> Post | None:
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Post)
+                .options(selectinload(Post.images))
+                .where(Post.id == post_id)
+            )
+            return result.scalar_one_or_none()
+
+    async def update_post(
+        self,
+        post_id: UUID,
+        draft: DraftPost,
+        status: PostStatus | None = None,
+    ) -> Post | None:
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Post)
+                .options(selectinload(Post.images))
+                .where(Post.id == post_id)
+            )
+            post = result.scalar_one_or_none()
+            if post is None:
+                return None
+
+            post.object_type = draft.object_type
+            post.source_photo_file_id = draft.photo_file_id
+            post.caption = draft.caption
+            post.price_text = draft.price_text
+            post.availability_text = draft.availability_text
+            post.story_text = draft.story_text
+            post.colors = draft.colors
+            post.style_tags = draft.style_tags
+            if status is not None:
+                post.status = status
+
+            if post.images:
+                primary_image = post.images[0]
+                primary_image.telegram_file_id = draft.photo_file_id
+                primary_image.is_primary = True
+                primary_image.position = 0
+            else:
+                session.add(
+                    PostImage(
+                        post_id=post.id,
+                        telegram_file_id=draft.photo_file_id,
+                        position=0,
+                        is_primary=True,
+                    )
+                )
+
+            await session.commit()
+            await session.refresh(post)
+            return post
+
     async def list_user_posts(
         self,
         user_id: UUID,
@@ -151,10 +207,24 @@ class PostRepository:
             )
             return result.scalars().all()
 
+    async def set_status(self, post_id: UUID, status: PostStatus) -> Post | None:
+        async with self.session_factory() as session:
+            post = await session.get(Post, post_id)
+            if post is None:
+                return None
+            post.status = status
+            if status is not PostStatus.published:
+                post.published_at = None
+                post.published_message_id = None
+            await session.commit()
+            await session.refresh(post)
+            return post
+
     async def mark_published(
         self,
         post_id: UUID,
         published_message_id: int | None = None,
+        channel_id: UUID | None = None,
     ) -> Post | None:
         async with self.session_factory() as session:
             post = await session.get(Post, post_id)
@@ -163,6 +233,7 @@ class PostRepository:
             post.status = PostStatus.published
             post.published_at = datetime.now(timezone.utc)
             post.published_message_id = published_message_id
+            post.channel_id = channel_id
             await session.commit()
             await session.refresh(post)
             return post

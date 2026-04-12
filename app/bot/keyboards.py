@@ -14,11 +14,14 @@ def make_preview_keyboard() -> InlineKeyboardBuilder:
     )
     kb.row(
         InlineKeyboardButton(text="Добавить цену", callback_data="add_price"),
-        InlineKeyboardButton(text="Добавить историю", callback_data="add_story"),
+        InlineKeyboardButton(text="Добавить наличие", callback_data="add_availability"),
     )
     kb.row(
+        InlineKeyboardButton(text="Добавить историю", callback_data="add_story"),
         InlineKeyboardButton(text="Редактировать вручную", callback_data="edit_caption"),
-        InlineKeyboardButton(text="Сохранить в черновики", callback_data="save_draft"),
     )
-    kb.row(InlineKeyboardButton(text="Отмена", callback_data="cancel"))
+    kb.row(
+        InlineKeyboardButton(text="Сохранить в черновики", callback_data="save_draft"),
+        InlineKeyboardButton(text="Отмена", callback_data="cancel"),
+    )
     return kb
