@@ -290,6 +290,23 @@ class DraftRepository:
             return []
         return await self.post_repository.list_user_posts(
             user_id=user.id,
-            statuses=(PostStatus.draft, PostStatus.ready),
+            statuses=(PostStatus.draft, PostStatus.ready, PostStatus.failed),
             limit=limit,
         )
+
+    async def get_user_draft(self, user_id: int, post_id: UUID) -> Post | None:
+        user = await self.user_repository.get_by_telegram_user_id(user_id)
+        if user is None:
+            return None
+        post = await self.post_repository.get_by_id(post_id)
+        if post is None or post.user_id != user.id:
+            return None
+        if post.status not in {PostStatus.draft, PostStatus.ready, PostStatus.failed}:
+            return None
+        return post
+
+    async def archive_user_draft(self, user_id: int, post_id: UUID) -> Post | None:
+        post = await self.get_user_draft(user_id, post_id)
+        if post is None:
+            return None
+        return await self.post_repository.set_status(post_id, PostStatus.archived)

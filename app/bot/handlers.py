@@ -9,7 +9,7 @@ from aiogram.types import CallbackQuery, Message
 from aiogram.types.error_event import ErrorEvent
 
 from app.bot.access import reject_callback_if_not_allowed, reject_message_if_not_allowed
-from app.bot.keyboards import make_preview_keyboard
+from app.bot.keyboards import make_draft_actions_keyboard, make_preview_keyboard
 from app.db.models import PostStatus
 from app.fsm.states import DraftCreation
 from app.schemas.draft import DraftPost
@@ -67,6 +67,47 @@ def setup_router(services: ServiceContainer, settings: Settings) -> Router:
                 logger.info("Preview message was not modified for user_id=%s", callback.from_user.id)
                 return False
             raise
+
+    async def remove_message_keyboard(callback: CallbackQuery) -> None:
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except TelegramBadRequest as exc:
+            if "message is not modified" in str(exc).lower():
+                return
+            logger.info("Could not remove keyboard for user_id=%s: %s", callback.from_user.id, exc)
+
+    async def send_preview_message(target_message: Message, draft: DraftPost) -> None:
+        await target_message.answer_photo(
+            photo=draft.photo_file_id,
+            caption=draft.build_preview_text(),
+            reply_markup=make_preview_keyboard().as_markup(),
+        )
+
+    def parse_post_id(raw_value: str) -> UUID | None:
+        try:
+            return UUID(raw_value)
+        except ValueError:
+            return None
+
+    async def load_user_draft_by_callback(
+        callback: CallbackQuery,
+        raw_post_id: str,
+    ) -> tuple[UUID | None, DraftPost | None, str | None, bool]:
+        callback_text: str | None = None
+        show_alert = False
+
+        if await reject_callback_if_not_allowed(callback, settings):
+            return None, None, callback_text, show_alert
+
+        post_id = parse_post_id(raw_post_id)
+        if post_id is None:
+            return None, None, "Не удалось распознать черновик.", True
+
+        post = await services.draft_repository.get_user_draft(callback.from_user.id, post_id)
+        if post is None:
+            return None, None, "Черновик не найден или уже недоступен.", True
+
+        return post_id, services.post_repository.build_draft_view(post), None, False
 
     async def load_post_for_callback(
         callback: CallbackQuery,
@@ -127,7 +168,7 @@ def setup_router(services: ServiceContainer, settings: Settings) -> Router:
             "Подсказка по работе с ботом:\n\n"
             "/start — краткое описание и быстрый старт\n"
             "/new — начать новый сценарий и отправить фото\n"
-            "/drafts — показать последние сохранённые черновики\n"
+            "/drafts — показать и открыть сохранённые черновики\n"
             "/cancel — отменить текущий сценарий\n\n"
             "После фото бот покажет предпросмотр, где можно:\n"
             "• перегенерировать подпись;\n"
@@ -159,17 +200,29 @@ def setup_router(services: ServiceContainer, settings: Settings) -> Router:
             )
             return
 
-        lines = ["Последние черновики:"]
+        await message.answer("Последние черновики:")
         for draft in drafts:
             caption_preview = (draft.caption or "").strip().replace("\n", " ")
             if len(caption_preview) > 80:
                 caption_preview = caption_preview[:77] + "..."
-            lines.append(f"• #{draft.id} | статус: {draft.status.value} | {draft.object_type or 'композиция'}")
-            if caption_preview:
-                lines.append(f"  {caption_preview}")
-        lines.append("")
-        lines.append("Пока команда показывает список. Восстановление черновика в предпросмотр будет следующим шагом.")
-        await message.answer("\n".join(lines))
+            status_title = draft.status.value
+            header = f"Черновик #{draft.id}\nСтатус: {status_title}\nТип: {draft.object_type or 'композиция'}"
+            text = header if not caption_preview else f"{header}\n\n{caption_preview}"
+
+            photo_file_id = draft.source_photo_file_id or (
+                draft.images[0].telegram_file_id if getattr(draft, "images", None) else None
+            )
+            if photo_file_id:
+                await message.answer_photo(
+                    photo=photo_file_id,
+                    caption=text,
+                    reply_markup=make_draft_actions_keyboard(str(draft.id)).as_markup(),
+                )
+            else:
+                await message.answer(
+                    text,
+                    reply_markup=make_draft_actions_keyboard(str(draft.id)).as_markup(),
+                )
 
     @router.message(Command("cancel"))
     async def cmd_cancel(message: Message, state: FSMContext) -> None:
@@ -178,7 +231,7 @@ def setup_router(services: ServiceContainer, settings: Settings) -> Router:
         await archive_current_post(state)
         await state.clear()
         logger.info("Current flow cancelled by user_id=%s", message.from_user.id)
-        await message.answer("Текущий сценарий отменён. Можно начать заново через /new.")
+        await message.answer("Сценарий отменён. Если нужно, начните заново через /new.")
 
     @router.message(DraftCreation.waiting_for_photo, F.photo)
     @router.message(F.photo)
@@ -235,12 +288,8 @@ def setup_router(services: ServiceContainer, settings: Settings) -> Router:
         await save_context_to_state(state, updated_post.id, draft)
         await state.set_state(None)
         logger.info("Updated price for user_id=%s", message.from_user.id)
-        await message.answer("Цену добавил. Ниже обновлённый предпросмотр.")
-        await message.answer_photo(
-            photo=draft.photo_file_id,
-            caption=draft.build_preview_text(),
-            reply_markup=make_preview_keyboard().as_markup(),
-        )
+        await message.answer("Цену добавил.")
+        await send_preview_message(message, draft)
 
     @router.message(DraftCreation.waiting_for_availability, F.text)
     async def receive_availability(message: Message, state: FSMContext) -> None:
@@ -260,12 +309,8 @@ def setup_router(services: ServiceContainer, settings: Settings) -> Router:
         await save_context_to_state(state, updated_post.id, draft)
         await state.set_state(None)
         logger.info("Updated availability for user_id=%s", message.from_user.id)
-        await message.answer("Наличие обновил. Ниже обновлённый предпросмотр.")
-        await message.answer_photo(
-            photo=draft.photo_file_id,
-            caption=draft.build_preview_text(),
-            reply_markup=make_preview_keyboard().as_markup(),
-        )
+        await message.answer("Наличие обновил.")
+        await send_preview_message(message, draft)
 
     @router.message(DraftCreation.waiting_for_manual_caption, F.text)
     async def receive_manual_caption(message: Message, state: FSMContext) -> None:
@@ -289,12 +334,8 @@ def setup_router(services: ServiceContainer, settings: Settings) -> Router:
         await save_context_to_state(state, updated_post.id, draft)
         await state.set_state(None)
         logger.info("Updated caption manually for user_id=%s", message.from_user.id)
-        await message.answer("Текст обновил. Ниже обновлённый предпросмотр.")
-        await message.answer_photo(
-            photo=draft.photo_file_id,
-            caption=draft.build_preview_text(),
-            reply_markup=make_preview_keyboard().as_markup(),
-        )
+        await message.answer("Текст обновил.")
+        await send_preview_message(message, draft)
 
     @router.callback_query(F.data == "shorten")
     async def cb_shorten(callback: CallbackQuery, state: FSMContext) -> None:
@@ -604,6 +645,115 @@ def setup_router(services: ServiceContainer, settings: Settings) -> Router:
             if post_id:
                 await services.post_repository.mark_failed(post_id, str(exc))
             callback_text = "Не удалось опубликовать пост в канал. Черновик сохранён со статусом ошибки."
+            show_alert = True
+        finally:
+            await callback.answer(callback_text, show_alert=show_alert)
+
+    @router.callback_query(F.data.startswith("draft_open:"))
+    async def cb_open_draft(callback: CallbackQuery, state: FSMContext) -> None:
+        callback_text = "Черновик открыт"
+        show_alert = False
+
+        try:
+            raw_post_id = callback.data.split(":", 1)[1]
+            post_id, draft, callback_text_override, show_alert_override = await load_user_draft_by_callback(
+                callback,
+                raw_post_id,
+            )
+            if callback_text_override:
+                callback_text = callback_text_override
+                show_alert = show_alert_override
+                return
+
+            assert post_id is not None and draft is not None
+            await save_context_to_state(state, post_id, draft)
+            await state.set_state(None)
+            await callback.message.reply("Открыл черновик для редактирования.")
+            await send_preview_message(callback.message, draft)
+            logger.info("Opened draft post_id=%s for user_id=%s", post_id, callback.from_user.id)
+        except Exception:
+            logger.exception("Open draft failed for user_id=%s", callback.from_user.id)
+            callback_text = "Не удалось открыть черновик."
+            show_alert = True
+        finally:
+            await callback.answer(callback_text, show_alert=show_alert)
+
+    @router.callback_query(F.data.startswith("draft_publish:"))
+    async def cb_publish_draft(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+        callback_text = "Опубликовано"
+        show_alert = False
+
+        try:
+            raw_post_id = callback.data.split(":", 1)[1]
+            post_id, draft, callback_text_override, show_alert_override = await load_user_draft_by_callback(
+                callback,
+                raw_post_id,
+            )
+            if callback_text_override:
+                callback_text = callback_text_override
+                show_alert = show_alert_override
+                return
+
+            assert post_id is not None and draft is not None
+            channel = await services.channel_repository.get_or_create(
+                telegram_chat_id=settings.default_channel_id,
+                title="Magnolia Verde",
+                is_default=True,
+            )
+            sent_message = await services.publisher.publish(
+                bot=bot,
+                chat_id=settings.default_channel_id,
+                draft=draft,
+            )
+            await services.post_repository.mark_published(
+                post_id=post_id,
+                published_message_id=sent_message.message_id,
+                channel_id=channel.id,
+            )
+            current_post_id = await get_post_id(state)
+            if current_post_id == post_id:
+                await state.clear()
+            await remove_message_keyboard(callback)
+            await callback.message.reply("Черновик опубликован в канал.")
+            logger.info("Published draft from drafts list post_id=%s user_id=%s", post_id, callback.from_user.id)
+        except Exception as exc:
+            logger.exception("Publish draft failed for user_id=%s", callback.from_user.id)
+            post_id = parse_post_id(callback.data.split(":", 1)[1])
+            if post_id:
+                await services.post_repository.mark_failed(post_id, str(exc))
+            callback_text = "Не удалось опубликовать черновик. Он сохранён со статусом ошибки."
+            show_alert = True
+        finally:
+            await callback.answer(callback_text, show_alert=show_alert)
+
+    @router.callback_query(F.data.startswith("draft_delete:"))
+    async def cb_delete_draft(callback: CallbackQuery, state: FSMContext) -> None:
+        callback_text = "Черновик удалён"
+        show_alert = False
+
+        try:
+            raw_post_id = callback.data.split(":", 1)[1]
+            post_id = parse_post_id(raw_post_id)
+            if post_id is None:
+                callback_text = "Не удалось распознать черновик."
+                show_alert = True
+                return
+
+            archived_post = await services.draft_repository.archive_user_draft(callback.from_user.id, post_id)
+            if archived_post is None:
+                callback_text = "Черновик не найден или уже удалён."
+                show_alert = True
+                return
+
+            current_post_id = await get_post_id(state)
+            if current_post_id == post_id:
+                await state.clear()
+            await remove_message_keyboard(callback)
+            await callback.message.reply("Черновик убран из активного списка.")
+            logger.info("Archived draft post_id=%s for user_id=%s", post_id, callback.from_user.id)
+        except Exception:
+            logger.exception("Delete draft failed for user_id=%s", callback.from_user.id)
+            callback_text = "Не удалось удалить черновик."
             show_alert = True
         finally:
             await callback.answer(callback_text, show_alert=show_alert)
